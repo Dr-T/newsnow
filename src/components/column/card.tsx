@@ -1,31 +1,33 @@
 import type { NewsItem, SourceID, SourceResponse } from "@shared/types"
 import { useQuery } from "@tanstack/react-query"
-import { AnimatePresence, motion } from "framer-motion"
-import type { SyntheticListenerMap } from "@dnd-kit/core/dist/hooks/utilities"
+import { AnimatePresence, motion, useInView } from "framer-motion"
 import { useWindowSize } from "react-use"
 import { forwardRef, useImperativeHandle } from "react"
 import { OverlayScrollbar } from "../common/overlay-scrollbar"
 import { safeParseString } from "~/utils"
-import { cache } from "~/utils/cache"
 
 export interface ItemsProps extends React.HTMLAttributes<HTMLDivElement> {
   id: SourceID
   /**
    * 是否显示透明度，拖动时原卡片的样式
    */
-  isDragged?: boolean
-  handleListeners?: SyntheticListenerMap
+  isDragging?: boolean
+  setHandleRef?: (ref: HTMLElement | null) => void
 }
 
 interface NewsCardProps {
   id: SourceID
-  handleListeners?: SyntheticListenerMap
+  setHandleRef?: (ref: HTMLElement | null) => void
 }
 
-export const CardWrapper = forwardRef<HTMLDivElement, ItemsProps>(({ id, isDragged, handleListeners, style, ...props }, dndRef) => {
+export const CardWrapper = forwardRef<HTMLElement, ItemsProps>(({ id, isDragging, setHandleRef, style, ...props }, dndRef) => {
   const ref = useRef<HTMLDivElement>(null)
 
-  useImperativeHandle(dndRef, () => ref.current!)
+  const inView = useInView(ref, {
+    once: true,
+  })
+
+  useImperativeHandle(dndRef, () => ref.current! as HTMLDivElement)
 
   return (
     <div
@@ -33,7 +35,7 @@ export const CardWrapper = forwardRef<HTMLDivElement, ItemsProps>(({ id, isDragg
       className={$(
         "flex flex-col h-500px rounded-2xl p-4 cursor-default",
         "backdrop-blur-5 transition-opacity-300",
-        isDragged && "op-50",
+        isDragging && "op-50",
         `bg-${sources[id].color}-500 dark:bg-${sources[id].color} bg-op-40!`,
       )}
       style={{
@@ -42,54 +44,62 @@ export const CardWrapper = forwardRef<HTMLDivElement, ItemsProps>(({ id, isDragg
       }}
       {...props}
     >
-      <NewsCard id={id} handleListeners={handleListeners} />
+      {inView && <NewsCard id={id} setHandleRef={setHandleRef} />}
     </div>
   )
 })
 
-function NewsCard({ id, handleListeners }: NewsCardProps) {
-  const { refresh, getRefreshId } = useRefetch()
-  const { data, isFetching, isPlaceholderData, isError } = useQuery({
-    queryKey: [id, getRefreshId(id)],
+function NewsCard({ id, setHandleRef }: NewsCardProps) {
+  const { refresh } = useRefetch()
+  const { data, isFetching, isError } = useQuery({
+    queryKey: ["source", id],
     queryFn: async ({ queryKey }) => {
-      const [_id, _refetchTime] = queryKey as [SourceID, number]
-      let url = `/s?id=${_id}`
+      const id = queryKey[1] as SourceID
+      let url = `/s?id=${id}`
       const headers: Record<string, any> = {}
-      if (Date.now() - _refetchTime < 1000) {
-        url = `/s?id=${_id}&latest`
+      if (refetchSources.has(id)) {
+        url = `/s?id=${id}&latest`
         const jwt = safeParseString(localStorage.getItem("jwt"))
         if (jwt) headers.Authorization = `Bearer ${jwt}`
-      } else if (cache.has(_id)) {
-        return cache.get(_id)
+        refetchSources.delete(id)
+      } else if (cacheSources.has(id)) {
+        // wait animation
+        await delay(200)
+        return cacheSources.get(id)
       }
 
       const response: SourceResponse = await myFetch(url, {
         headers,
       })
 
-      try {
-        if (response.items && sources[_id].type === "hottest" && cache.has(_id)) {
-          response.items.forEach((item, i) => {
-            const o = cache.get(_id)!.items.findIndex(k => k.id === item.id)
-            item.extra = {
-              ...item?.extra,
-              diff: o === -1 ? undefined : o - i,
-            }
-          })
+      function diff() {
+        try {
+          if (response.items && sources[id].type === "hottest" && cacheSources.has(id)) {
+            response.items.forEach((item, i) => {
+              const o = cacheSources.get(id)!.items.findIndex(k => k.id === item.id)
+              item.extra = {
+                ...item?.extra,
+                diff: o === -1 ? undefined : o - i,
+              }
+            })
+          }
+        } catch (e) {
+          console.error(e)
         }
-      } catch (e) {
-        console.log(e)
       }
 
-      cache.set(_id, response)
+      diff()
+
+      cacheSources.set(id, response)
       return response
     },
     placeholderData: prev => prev,
-    staleTime: 1000 * 60 * 1,
+    staleTime: Infinity,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
     retry: false,
   })
-
-  const isFreshFetching = useMemo(() => isFetching && !isPlaceholderData, [isFetching, isPlaceholderData])
 
   const { isFocused, toggleFocus } = useFocusWith(id)
 
@@ -130,9 +140,9 @@ function NewsCard({ id, handleListeners }: NewsCardProps) {
             className={$("btn", isFocused ? "i-ph:star-fill" : "i-ph:star-duotone")}
             onClick={toggleFocus}
           />
-          {handleListeners && (
+          {setHandleRef && (
             <button
-              {...handleListeners}
+              ref={setHandleRef}
               type="button"
               className={$("btn", "i-ph:dots-six-vertical-duotone", "cursor-grab")}
             />
@@ -143,15 +153,15 @@ function NewsCard({ id, handleListeners }: NewsCardProps) {
       <OverlayScrollbar
         className={$([
           "h-full p-2 overflow-y-auto rounded-2xl bg-base bg-op-70!",
-          isFreshFetching && `animate-pulse`,
+          isFetching && `animate-pulse`,
           `sprinkle-${sources[id].color}`,
         ])}
         options={{
           overflow: { x: "hidden" },
         }}
-        defer={false}
+        defer
       >
-        <div className={$("transition-opacity-500", isFreshFetching && "op-20")}>
+        <div className={$("transition-opacity-500", isFetching && "op-20")}>
           {!!data?.items?.length && (sources[id].type === "hottest" ? <NewsListHot items={data.items} /> : <NewsListTimeLine items={data.items} />)}
         </div>
       </OverlayScrollbar>
